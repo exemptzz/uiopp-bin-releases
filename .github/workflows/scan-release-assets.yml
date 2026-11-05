@@ -1,0 +1,104 @@
+name: Scan release assets for secrets
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to scan (e.g. v1.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scan-release-assets-${{ github.workflow }}-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: "8.24.2"
+  TRUFFLEHOG_VERSION: "3.88.0"
+
+jobs:
+  scan-release-assets:
+    name: Scan published release assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.release.tag_name }}" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download release assets (read-only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          gh release download "${{ steps.tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --dir release-assets
+          echo "Downloaded assets:"
+          ls -la release-assets
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Gitleaks scan (release assets)
+        run: |
+          set -euo pipefail
+          gitleaks detect \
+            --source release-assets \
+            --no-git \
+            --redact \
+            --verbose
+
+      - name: Install TruffleHog
+        run: |
+          set -euo pipefail
+          curl -sSfL \
+            "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz
+          sudo install -m 0755 trufflehog /usr/local/bin/trufflehog
+          trufflehog --version
+
+      - name: TruffleHog scan (verified secrets only)
+        run: |
+          set -euo pipefail
+          trufflehog filesystem release-assets \
+            --results=verified \
+            --fail \
+            --no-update \
+            --github-actions
+
+      - name: Pattern scan (PEM private keys and common tokens)
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r -d '' f; do
+            if strings "$f" | grep -qE 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY'; then
+              echo "::error file=${f}::Possible PEM private key material detected in release asset (pattern match)."
+              found=1
+            fi
+            if strings "$f" | grep -qE '(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9]{20,})'; then
+              echo "::error file=${f}::Possible API token pattern detected in release asset (pattern match)."
+              found=1
+            fi
+          done < <(find release-assets -type f -print0)
+          if [ "$found" -ne 0 ]; then
+            echo "::error::Secret-like patterns found in release assets. Aborting."
+            exit 1
+          fi
+          echo "Pattern scan passed."
